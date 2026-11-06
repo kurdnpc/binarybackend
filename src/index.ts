@@ -13,7 +13,7 @@ import { publicRouter } from "./routes/public.js";
 const app = express();
 
 app.disable("x-powered-by");
-app.set("trust proxy", 1);
+app.set("trust proxy", true); // behind Railway edge + the Next.js /backend proxy
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(
   cors({
