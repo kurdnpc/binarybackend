@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import type { PoolClient } from "pg";
 import { pool, q } from "../db/pool.js";
 import { requireAdmin } from "../lib/auth.js";
 import { HttpError, ok, parse } from "../lib/http.js";
@@ -213,6 +214,88 @@ adminRouter.delete("/systems/:slug", async (req, res) => {
   res.json(ok(true));
 });
 
+/* ---------- Systems import (JSON / CSV converted in the browser) ---------- */
+
+const ImportSystem = SystemBody.extend({ createdAt: z.string().regex(/^\d{4}-\d{2}-\d{2}/).optional() });
+type ImportSystemT = z.infer<typeof ImportSystem>;
+const COMPARED = ["category", "icon", "name", "short", "description", "intro", "tags", "platforms", "specs", "demoMessage", "featured", "published", "sort"] as const;
+
+const issuesOf = (e: z.ZodError) => e.issues.map((i) => `${i.path.join(".") || "row"}: ${i.message}`);
+
+type SystemsPlan = {
+  created: string[];
+  updated: { slug: string; fields: string[] }[];
+  unchanged: string[];
+  errors: { row: number; slug?: string; issues: string[] }[];
+  valid: ImportSystemT[];
+};
+
+/** Validate every row and compare with what is stored (matched by slug). Systems not in the file are kept. */
+async function planSystems(rows: unknown[]): Promise<SystemsPlan> {
+  const { rows: existing } = await q<SystemRow>("SELECT * FROM systems");
+  const bySlug = new Map(existing.map((r) => [r.slug, mapSystem(r)]));
+  const plan: SystemsPlan = { created: [], updated: [], unchanged: [], errors: [], valid: [] };
+  const seen = new Set<string>();
+  rows.forEach((raw, i) => {
+    const r = ImportSystem.safeParse(raw);
+    const slug = typeof (raw as { slug?: unknown })?.slug === "string" ? (raw as { slug: string }).slug : undefined;
+    if (!r.success) return void plan.errors.push({ row: i + 1, slug, issues: issuesOf(r.error) });
+    const s = { ...r.data, demoMessage: r.data.demoMessage?.trim() || null };
+    if (seen.has(s.slug)) return void plan.errors.push({ row: i + 1, slug: s.slug, issues: ["slug: duplicated in the file"] });
+    seen.add(s.slug);
+    plan.valid.push(s);
+    const cur = bySlug.get(s.slug);
+    if (!cur) return void plan.created.push(s.slug);
+    const fields = COMPARED.filter((f) => JSON.stringify(cur[f] ?? null) !== JSON.stringify(s[f] ?? null));
+    if (fields.length) plan.updated.push({ slug: s.slug, fields: [...fields] });
+    else plan.unchanged.push(s.slug);
+  });
+  return plan;
+}
+
+async function applySystems(client: PoolClient, list: ImportSystemT[]) {
+  for (const s of list) {
+    await client.query(
+      `INSERT INTO systems (slug, category, icon, name, short, description, intro, tags, platforms, specs, demo_message, featured, published, sort, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, coalesce($15::timestamptz, now()))
+       ON CONFLICT (slug) DO UPDATE SET category=EXCLUDED.category, icon=EXCLUDED.icon, name=EXCLUDED.name, short=EXCLUDED.short,
+         description=EXCLUDED.description, intro=EXCLUDED.intro, tags=EXCLUDED.tags, platforms=EXCLUDED.platforms, specs=EXCLUDED.specs,
+         demo_message=EXCLUDED.demo_message, featured=EXCLUDED.featured, published=EXCLUDED.published, sort=EXCLUDED.sort, updated_at=now()`,
+      [s.slug, s.category, s.icon, s.name, s.short, s.description, s.intro, s.tags, s.platforms, JSON.stringify(s.specs), s.demoMessage ?? null, s.featured, s.published, s.sort, s.createdAt ?? null],
+    );
+  }
+}
+
+async function inTransaction<T>(fn: (c: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const r = await fn(client);
+    await client.query("COMMIT");
+    return r;
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+const ImportBody = z.object({ systems: z.array(z.unknown()).min(1).max(500), dryRun: z.boolean().default(true) });
+
+/** dryRun=true → preview only. dryRun=false → valid rows are upserted in one transaction (rows with errors are skipped). */
+adminRouter.post("/systems/import", async (req, res) => {
+  const b = parse(ImportBody, req.body);
+  const { valid, ...summary } = await planSystems(b.systems);
+  let applied = false;
+  if (!b.dryRun && valid.length) {
+    await inTransaction((c) => applySystems(c, valid));
+    revalidateWeb(["systems", ...valid.map((s) => `system:${s.slug}`)]);
+    applied = true;
+  }
+  res.json(ok({ ...summary, applied }));
+});
+
 /* ============ Simple collections: testimonials / faqs / team ============ */
 
 const collections = {
@@ -282,9 +365,17 @@ adminRouter.get("/sections", async (_req, res) => {
   res.json(ok(rows));
 });
 
+// Section text per language: { ckb: { title: "…", tags: ["…"], items: [{ title: "…", tags: ["…"] }] } }
+const Text = z.string().max(4000);
+const TextList = z.array(z.string().max(300)).max(40);
+const ContentValue = z.union([Text, TextList, z.array(z.record(z.string().max(40), z.union([Text, TextList]))).max(40)]);
+
 const SectionPatch = z.object({
   visible: z.boolean().optional(),
-  content: z.record(z.string(), z.record(z.string(), z.string().max(2000))).optional(),
+  content: z
+    .record(z.string().max(10), z.record(z.string().max(40), ContentValue))
+    .refine((c) => JSON.stringify(c).length < 150_000, "Content too large")
+    .optional(),
 });
 
 adminRouter.patch("/sections/:page/:key", async (req, res) => {
@@ -316,6 +407,24 @@ adminRouter.put("/sections/:page/order", async (req, res) => {
   }
   revalidateWeb(["sections"]);
   res.json(ok(true));
+});
+
+/* =========================== Page meta (browser tab title + description) =========================== */
+
+const PAGE_KEYS = ["home", "services", "systems", "about", "contact"] as const;
+const PageMeta = z.object({ title: z.string().trim().max(80), description: z.string().trim().max(300) });
+
+adminRouter.put("/pages/:page/meta", async (req, res) => {
+  const page = parse(z.enum(PAGE_KEYS), req.params.page);
+  const meta = parse(PageMeta, req.body);
+  const { rows } = await q<{ value: unknown }>(
+    `INSERT INTO settings (key, value, updated_at) VALUES ('pages', jsonb_build_object($1::text, $2::jsonb), now())
+     ON CONFLICT (key) DO UPDATE SET value = settings.value || jsonb_build_object($1::text, $2::jsonb), updated_at = now()
+     RETURNING value`,
+    [page, JSON.stringify(meta)],
+  );
+  revalidateWeb(["settings"]);
+  res.json(ok(rows[0].value));
 });
 
 /* =========================== Settings =========================== */
@@ -364,4 +473,190 @@ adminRouter.put("/settings", async (req, res) => {
   }
   revalidateWeb(["settings"]);
   res.json(ok(s));
+});
+
+/* =========================== Whole-site backup / restore =========================== */
+// Content only: systems, page sections, testimonials, FAQ, team, settings. Never leads, admins or analytics.
+
+const BACKUP_TYPE = "binary-group/backup";
+const COLLECTIONS = ["testimonials", "faqs", "team"] as const;
+const PARTS = ["systems", "sections", "testimonials", "faqs", "team", "settings"] as const;
+type Part = (typeof PARTS)[number];
+
+adminRouter.get("/backup", async (_req, res) => {
+  const [systems, sections, testimonials, faqs, team, settings] = await Promise.all([
+    q<SystemRow>("SELECT * FROM systems ORDER BY sort, created_at DESC"),
+    q("SELECT page, key, title, subtitle, visible, sort, content FROM page_sections ORDER BY page, sort"),
+    q("SELECT * FROM testimonials ORDER BY sort"),
+    q("SELECT * FROM faqs ORDER BY sort"),
+    q("SELECT * FROM team ORDER BY sort"),
+    q<{ key: string; value: unknown }>("SELECT key, value FROM settings ORDER BY key"),
+  ]);
+  res.setHeader("Content-Disposition", `attachment; filename="binary-group-backup-${new Date().toISOString().slice(0, 10)}.json"`);
+  res.json({
+    type: BACKUP_TYPE,
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    systems: systems.rows.map((r) => {
+      const { updatedAt: _u, ...rest } = mapSystem(r);
+      return rest;
+    }),
+    sections: sections.rows,
+    testimonials: testimonials.rows,
+    faqs: faqs.rows,
+    team: team.rows,
+    settings: Object.fromEntries(settings.rows.map((r) => [r.key, r.value])),
+  });
+});
+
+const BackupSection = z.object({
+  page: z.string().min(1).max(40),
+  key: z.string().min(1).max(40),
+  title: z.string().min(1).max(120),
+  subtitle: z.string().max(200).nullable().optional(),
+  visible: z.boolean(),
+  sort: z.number().int(),
+  content: z.record(z.string().max(10), z.record(z.string().max(40), ContentValue)),
+});
+const PagesMeta = z.record(z.enum(PAGE_KEYS), PageMeta);
+const BackupSettings = Settings.partial().extend({ pages: PagesMeta.optional() });
+
+const RestoreBody = z.object({
+  backup: z.object({ type: z.literal(BACKUP_TYPE), version: z.literal(1) }).passthrough(),
+  parts: z.array(z.enum(PARTS)).min(1),
+  dryRun: z.boolean().default(true),
+});
+
+type PartReport = { count: number; errors: string[]; note?: string; plan?: Omit<SystemsPlan, "valid"> };
+
+/** Validate the chosen parts; dryRun=false applies them in ONE transaction (any invalid part blocks the restore). */
+adminRouter.post("/backup/restore", async (req, res) => {
+  const { backup, parts, dryRun } = parse(RestoreBody, req.body);
+  const data = backup as Record<string, unknown>;
+  const report: Partial<Record<Part, PartReport>> = {};
+  const apply: ((c: PoolClient) => Promise<void>)[] = [];
+  const arr = (k: string) => (Array.isArray(data[k]) ? (data[k] as unknown[]) : null);
+
+  for (const part of parts) {
+    if (part === "systems") {
+      const list = arr("systems");
+      if (!list) { report.systems = { count: 0, errors: ["missing"] }; continue; }
+      const { valid, ...plan } = await planSystems(list);
+      report.systems = { count: valid.length, errors: plan.errors.map((e) => `#${e.row} ${e.slug ?? ""} — ${e.issues.join("; ")}`), plan, note: "merge by slug — systems not in the file are kept" };
+      apply.push((c) => applySystems(c, valid));
+    } else if (part === "sections") {
+      const r = z.array(BackupSection).max(200).safeParse(data.sections);
+      if (!r.success) { report.sections = { count: 0, errors: issuesOf(r.error).slice(0, 20) }; continue; }
+      report.sections = { count: r.data.length, errors: [], note: "text, visibility and order of each section" };
+      apply.push(async (c) => {
+        for (const s of r.data) {
+          await c.query(
+            `INSERT INTO page_sections (page, key, title, subtitle, visible, sort, content, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7, now())
+             ON CONFLICT (page, key) DO UPDATE SET title=EXCLUDED.title, subtitle=EXCLUDED.subtitle, visible=EXCLUDED.visible, sort=EXCLUDED.sort, content=EXCLUDED.content, updated_at=now()`,
+            [s.page, s.key, s.title, s.subtitle ?? null, s.visible, s.sort, JSON.stringify(s.content)],
+          );
+        }
+      });
+    } else if (part === "settings") {
+      const r = BackupSettings.safeParse(data.settings);
+      if (!r.success) { report.settings = { count: 0, errors: issuesOf(r.error).slice(0, 20) }; continue; }
+      const entries = Object.entries(r.data).filter(([, v]) => v !== undefined);
+      report.settings = { count: entries.length, errors: [] };
+      apply.push(async (c) => {
+        for (const [key, value] of entries) {
+          await c.query(
+            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+            [key, JSON.stringify(value)],
+          );
+        }
+      });
+    } else {
+      const table = part;
+      const def = collections[table];
+      const r = z.array(def.schema.extend({ id: Uuid.optional() })).max(200).safeParse(data[table]);
+      if (!r.success) { report[table] = { count: 0, errors: issuesOf(r.error).slice(0, 20) }; continue; }
+      report[table] = { count: r.data.length, errors: [], note: "replaces the current list" };
+      apply.push(async (c) => {
+        await c.query(`DELETE FROM ${table}`);
+        const cols = def.cols as readonly string[];
+        for (const row of r.data as Record<string, unknown>[]) {
+          await c.query(
+            `INSERT INTO ${table} (id, ${cols.join(",")}) VALUES (coalesce($1::uuid, gen_random_uuid()), ${cols.map((_, i) => `$${i + 2}`).join(",")})`,
+            [row.id ?? null, ...cols.map((k) => row[k] ?? null)],
+          );
+        }
+      });
+    }
+  }
+
+  // systems rows with errors are skipped; any other part with errors blocks the restore
+  const blocking = Object.entries(report).filter(([k, v]) => k !== "systems" && v.errors.length);
+  let applied = false;
+  if (!dryRun) {
+    if (blocking.length) throw new HttpError(400, "Backup has invalid parts", Object.fromEntries(blocking.map(([k, v]) => [k, v.errors])));
+    await inTransaction(async (c) => {
+      for (const fn of apply) await fn(c);
+    });
+    revalidateWeb(["systems", "sections", "settings", "testimonials", "faqs", "team"]);
+    applied = true;
+  }
+  res.json(ok({ report, applied }));
+});
+
+/* =========================== Dynamic QR codes =========================== */
+
+const QrCode = z.string().regex(/^[a-z0-9-]{2,40}$/, "a-z, 0-9 and - only (2–40)");
+// internal path ("/systems/salon", "/services#web") or an external https link — never "//host" or javascript:
+const QrTarget = z
+  .string()
+  .trim()
+  .max(500)
+  .refine((t) => (t.startsWith("/") && !t.startsWith("//") && !t.includes("\\")) || /^https:\/\/[^\s/$.?#][^\s]*$/i.test(t), "must start with / or https://");
+const QrBody = z.object({ code: QrCode, label: z.string().trim().min(1).max(80), target: QrTarget, active: z.boolean().default(true) });
+
+adminRouter.get("/qr", async (_req, res) => {
+  const { rows } = await q(
+    `SELECT l.code, l.label, l.target, l.active, l.created_at, l.updated_at,
+            coalesce((SELECT sum(scans) FROM qr_scans s WHERE s.code = l.code), 0)::int AS total,
+            coalesce((SELECT sum(scans) FROM qr_scans s WHERE s.code = l.code AND s.day >= (now() AT TIME ZONE 'Asia/Baghdad')::date - 6), 0)::int AS week,
+            (SELECT json_agg(json_build_object('day', to_char(d, 'YYYY-MM-DD'), 'scans', coalesce(s.scans, 0)) ORDER BY d)
+               FROM generate_series((now() AT TIME ZONE 'Asia/Baghdad')::date - 29, (now() AT TIME ZONE 'Asia/Baghdad')::date, interval '1 day') d
+               LEFT JOIN qr_scans s ON s.code = l.code AND s.day = d::date) AS series
+       FROM qr_links l
+      ORDER BY (l.code = 'main') DESC, l.created_at`,
+  );
+  res.json(ok(rows));
+});
+
+adminRouter.post("/qr", async (req, res) => {
+  const b = parse(QrBody, req.body);
+  const { rows } = await q("INSERT INTO qr_links (code, label, target, active) VALUES ($1,$2,$3,$4) RETURNING *", [b.code, b.label, b.target, b.active]).catch(
+    (e: { code?: string }) => {
+      if (e.code === "23505") throw new HttpError(409, "This code already exists");
+      throw e;
+    },
+  );
+  res.status(201).json(ok(rows[0]));
+});
+
+adminRouter.put("/qr/:code", async (req, res) => {
+  const b = parse(QrBody, req.body);
+  const old = String(req.params.code);
+  // the main code backs /redirect — its name is fixed
+  if (old === "main" && b.code !== "main") throw new HttpError(400, "The main code cannot be renamed");
+  const { rows } = await q(
+    "UPDATE qr_links SET code=$2, label=$3, target=$4, active=$5, updated_at=now() WHERE code=$1 RETURNING *",
+    [old, b.code, b.label, b.target, b.active],
+  ).catch((e: { code?: string }) => {
+    if (e.code === "23505") throw new HttpError(409, "This code already exists");
+    throw e;
+  });
+  if (!rows[0]) throw new HttpError(404, "QR code not found");
+  res.json(ok(rows[0]));
+});
+
+adminRouter.delete("/qr/:code", async (req, res) => {
+  if (req.params.code === "main") throw new HttpError(400, "The main code cannot be deleted");
+  await q("DELETE FROM qr_links WHERE code=$1", [req.params.code]);
+  res.json(ok(true));
 });

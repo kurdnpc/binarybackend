@@ -22,6 +22,8 @@ app.use(
   }),
 );
 app.use(compression());
+// systems import + whole-site restore can carry larger files (admin only, still validated row by row)
+app.use(["/api/admin/systems/import", "/api/admin/backup"], express.json({ limit: "5mb" }));
 app.use(express.json({ limit: "200kb" }));
 app.use(express.text({ type: "text/plain", limit: "10kb" })); // navigator.sendBeacon payloads
 app.use(cookieParser());

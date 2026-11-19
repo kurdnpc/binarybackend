@@ -67,19 +67,32 @@ async function seedContent() {
     ["home", "systems", "سیستەمەکان", "5 سیستەم", true],
     ["home", "testimonials", "ڕای کڕیاران", "3 ڕا", true],
     ["home", "cta", "بانگهێشت (CTA)", "دوگمەی واتسئەپ", true],
-    ["services", "rows", "خزمەتگوزارییەکان", "8 خزمەتگوزاری", true],
+    ["services", "hero", "سەرەتا (Hero)", "ناونیشانی پەڕە", true],
+    ["services", "rows", "خزمەتگوزارییەکان", "7 خزمەتگوزاری", true],
     ["services", "tech", "ئامرازەکانی کارمان", "6 گروپ", true],
     ["services", "process", "شێوازی کارکردن", "4 هەنگاو", true],
     ["services", "faq", "پرسیارە باوەکان", "5 پرسیار", true],
     ["services", "cta", "بانگهێشت (CTA)", "", true],
+    ["about", "hero", "سەرەتا (Hero)", "ناونیشان و وەسف", true],
     ["about", "story", "چیرۆکەکەمان", "ژمارەکان", true],
     ["about", "values", "بەهاکانمان", "4 بەها", true],
     ["about", "team", "تیمەکە", "ئەندامانی تیم", true],
     ["about", "cta", "بانگهێشت (CTA)", "", true],
+    ["contact", "hero", "سەرەتا (Hero)", "ناونیشان و وەسف", true],
     ["contact", "form", "فۆرمی پەیوەندی", "", true],
     ["contact", "channels", "ڕاستەوخۆ", "واتسئەپ، ئیمەیڵ، ناونیشان", true],
     ["contact", "map", "نەخشە", "", true],
     ["contact", "faq", "پرسیارە باوەکان", "", true],
+    ["systems", "hero", "سەرەتا (Hero)", "ناونیشان و وەسف", true],
+    ["systems", "explorer", "گەڕان و لیستی سیستەمەکان", "فلتەر، ڕیزکردن، کارت", true],
+    ["systems", "includes", "لە هەموو سیستەمێکدا", "4 خاڵ", true],
+    ["systems", "demo", "داواکردنی دیمۆ", "دوگمەی واتسئەپ", true],
+    ["system", "hero", "سەرەتا (Hero)", "دوگمەکان و ڕێڕەو", true],
+    ["system", "features", "تایبەتمەندییەکان", "ناونیشان و زانیارییەکان", true],
+    ["system", "demo", "داواکردنی دیمۆ", "دوگمەی واتسئەپ", true],
+    ["system", "others", "سیستەمەکانی تر", "", true],
+    ["global", "header", "سەرپەڕە (Header)", "مینیو و دوگمەکان", true],
+    ["global", "footer", "پێپەڕە (Footer)", "ستوونەکان و لینکەکان", true],
   ];
   const heroContent = {
     ckb: {
@@ -97,7 +110,8 @@ async function seedContent() {
     await pool.query(
       `INSERT INTO page_sections (page, key, title, subtitle, visible, sort, content) VALUES ($1,$2,$3,$4,$5,$6,$7)
        ON CONFLICT (page, key) DO NOTHING`,
-      [page, key, title, subtitle, visible, order[page], JSON.stringify(page === "home" && key === "hero" ? heroContent : {})],
+      // hero always sorts first, also when added to an existing database later
+      [page, key, title, subtitle, visible, key === "hero" ? -1 : order[page], JSON.stringify(page === "home" && key === "hero" ? heroContent : {})],
     );
   }
 
@@ -118,6 +132,8 @@ async function seedContent() {
   for (const [key, value] of Object.entries(settings)) {
     await pool.query("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING", [key, JSON.stringify(value)]);
   }
+  // the fixed main QR (/redirect) always exists
+  await pool.query("INSERT INTO qr_links (code, label, target) VALUES ('main', 'QR ـی سەرەکی', '/') ON CONFLICT (code) DO NOTHING");
   console.log("sections + settings");
 }
 

@@ -118,3 +118,21 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_created_idx ON events (created_at DESC);
 CREATE INDEX IF NOT EXISTS events_type_created_idx ON events (type, created_at DESC);
+
+-- Dynamic QR codes: the printed QR always points at /redirect (code "main") or /r/<code>;
+-- the destination is chosen in the admin and can change at any time.
+CREATE TABLE IF NOT EXISTS qr_links (
+  code       text PRIMARY KEY,
+  label      text NOT NULL,
+  target     text NOT NULL DEFAULT '/',
+  active     boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+-- Cookieless scan counter: one row per code per day (no IP, no visitor id).
+CREATE TABLE IF NOT EXISTS qr_scans (
+  code  text NOT NULL REFERENCES qr_links (code) ON UPDATE CASCADE ON DELETE CASCADE,
+  day   date NOT NULL,
+  scans int NOT NULL DEFAULT 0,
+  PRIMARY KEY (code, day)
+);

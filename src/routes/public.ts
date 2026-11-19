@@ -43,8 +43,29 @@ publicRouter.get("/sections/:page", async (req, res) => {
 });
 
 publicRouter.get("/settings", async (_req, res) => {
-  const { rows } = await q<{ key: string; value: unknown }>("SELECT key, value FROM settings WHERE key = ANY($1)", [["general", "appearance", "whatsapp", "location"]]);
+  const { rows } = await q<{ key: string; value: unknown }>("SELECT key, value FROM settings WHERE key = ANY($1)", [["general", "appearance", "whatsapp", "location", "pages"]]);
   res.json(ok(Object.fromEntries(rows.map((r) => [r.key, r.value]))));
+});
+
+/* ---------------- dynamic QR redirect ---------------- */
+
+// link-preview fetchers (WhatsApp, Telegram, iMessage…) open the link without a person scanning it
+const PREVIEW_BOT = /bot|crawl|spider|slurp|headless|preview|whatsapp|telegram|facebookexternalhit|slack|discord|skype|twitter|linkedin|embedly|vkshare|pinterest/i;
+
+/** Called by the website's /redirect and /r/:code routes. Returns where to send the visitor (null → home). */
+publicRouter.get("/qr/:code", async (req, res) => {
+  const code = String(req.params.code).toLowerCase();
+  const { rows } = await q<{ target: string }>("SELECT target FROM qr_links WHERE code = $1 AND active", [code]);
+  res.set("Cache-Control", "no-store");
+  if (!rows[0]) return void res.json(ok({ target: null }));
+  if (req.query.track === "1" && !PREVIEW_BOT.test(req.get("user-agent") ?? "")) {
+    await q(
+      `INSERT INTO qr_scans (code, day, scans) VALUES ($1, (now() AT TIME ZONE 'Asia/Baghdad')::date, 1)
+       ON CONFLICT (code, day) DO UPDATE SET scans = qr_scans.scans + 1`,
+      [code],
+    );
+  }
+  res.json(ok({ target: rows[0].target }));
 });
 
 /* ---------------- leads (contact form) ---------------- */
