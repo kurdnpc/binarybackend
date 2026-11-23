@@ -136,3 +136,8 @@ CREATE TABLE IF NOT EXISTS qr_scans (
   scans int NOT NULL DEFAULT 0,
   PRIMARY KEY (code, day)
 );
+
+-- Allow the "system_click" analytics event (visitor clicked a link to a system page).
+ALTER TABLE events DROP CONSTRAINT IF EXISTS events_type_check;
+ALTER TABLE events ADD CONSTRAINT events_type_check CHECK (type IN ('pageview', 'leave', 'whatsapp', 'system_click'));
+CREATE INDEX IF NOT EXISTS events_system_click_idx ON events ((meta->>'system'), created_at DESC) WHERE type = 'system_click';

@@ -102,7 +102,7 @@ publicRouter.post("/leads", leadLimiter, async (req, res) => {
 const trackLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: "draft-8", legacyHeaders: false });
 
 const TrackBody = z.object({
-  type: z.enum(["pageview", "leave", "whatsapp"]),
+  type: z.enum(["pageview", "leave", "whatsapp", "system_click"]),
   path: z.string().max(300).startsWith("/"),
   session: z.string().min(8).max(64),
   ref: z.string().max(300).optional(),

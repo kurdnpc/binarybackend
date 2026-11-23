@@ -19,7 +19,7 @@ const pct = (cur: number, prev: number) => (prev === 0 ? (cur > 0 ? 100 : 0) : M
 adminRouter.get("/stats", async (req, res) => {
   const days = Math.min(90, Math.max(7, Number(req.query.days) || 30));
 
-  const [kpi, series, topPages, whatsapp, leads] = await Promise.all([
+  const [kpi, series, topPages, whatsapp, leads, sysClicks, sysTotals] = await Promise.all([
     q<{ today: number; yesterday: number; cur: number; prev: number; wa: number; wa_prev: number }>(
       `SELECT
          (SELECT count(DISTINCT visitor) FROM events WHERE type='pageview' AND created_at >= date_trunc('day', now()))::int AS today,
@@ -53,6 +53,21 @@ adminRouter.get("/stats", async (req, res) => {
       [days],
     ),
     q<{ status: string; n: number }>("SELECT status::text, count(*)::int AS n FROM leads GROUP BY status"),
+    // which systems visitors click on (links to /systems/<slug>), with current name/icon from the systems table
+    q<{ system: string; name: string | null; icon: string | null; clicks: number; visitors: number }>(
+      `SELECT e.meta->>'system' AS system, s.name, s.icon,
+              count(*)::int AS clicks, count(DISTINCT e.visitor)::int AS visitors
+         FROM events e LEFT JOIN systems s ON s.slug = e.meta->>'system'
+        WHERE e.type='system_click' AND e.meta->>'system' IS NOT NULL AND e.created_at >= now() - make_interval(days => $1)
+        GROUP BY 1, 2, 3 ORDER BY clicks DESC LIMIT 12`,
+      [days],
+    ),
+    q<{ cur: number; prev: number }>(
+      `SELECT count(*) FILTER (WHERE created_at >= now() - make_interval(days => $1))::int AS cur,
+              count(*) FILTER (WHERE created_at < now() - make_interval(days => $1))::int AS prev
+         FROM events WHERE type='system_click' AND created_at >= now() - make_interval(days => $1 * 2)`,
+      [days],
+    ),
   ]);
 
   const k = kpi.rows[0];
@@ -70,6 +85,7 @@ adminRouter.get("/stats", async (req, res) => {
       totalViews,
       topPages: topPages.rows,
       whatsappBySystem: whatsapp.rows,
+      systemClicks: { total: sysTotals.rows[0].cur, change: pct(sysTotals.rows[0].cur, sysTotals.rows[0].prev), bySystem: sysClicks.rows },
       leads: Object.fromEntries(leads.rows.map((r) => [r.status, r.n])),
     }),
   );
