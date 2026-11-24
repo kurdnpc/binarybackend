@@ -119,7 +119,7 @@ async function seedContent() {
     general: {
       nameKu: "باینەری گروپ",
       nameEn: "Binary Group",
-      tagline: "ماڵپەڕ، ئەپ و سیستەم دیزاین و دروست دەکەین — لە سلێمانییەوە بۆ هەموو کوردستان و عێراق.",
+      tagline: "ماڵپەڕ، ئەپ و سیستەم دیزاین و دروست دەکەین، لە سلێمانییەوە بۆ هەموو کوردستان و عێراق.",
       whatsapp: "0750 000 0000",
       email: "hello@binarygroup.dev",
       address: "سلێمانی، هەرێمی کوردستان",
