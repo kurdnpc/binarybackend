@@ -445,6 +445,8 @@ adminRouter.put("/pages/:page/meta", async (req, res) => {
 
 /* =========================== Settings =========================== */
 
+const SocialUrl = z.string().trim().max(300).refine((v) => v === "" || /^https:\/\/[^\s]+$/i.test(v), "must be empty or start with https://").default("");
+
 const Settings = z.object({
   general: z.object({
     nameKu: z.string().min(1).max(80),
@@ -472,6 +474,10 @@ const Settings = z.object({
     zoom: z.number().int().min(3).max(19),
     showMap: z.boolean(),
   }),
+  // social profile links (empty = hidden on the website)
+  social: z
+    .object({ instagram: SocialUrl, facebook: SocialUrl, linkedin: SocialUrl, tiktok: SocialUrl, youtube: SocialUrl, x: SocialUrl })
+    .optional(),
 });
 
 adminRouter.get("/settings", async (_req, res) => {

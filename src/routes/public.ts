@@ -43,7 +43,7 @@ publicRouter.get("/sections/:page", async (req, res) => {
 });
 
 publicRouter.get("/settings", async (_req, res) => {
-  const { rows } = await q<{ key: string; value: unknown }>("SELECT key, value FROM settings WHERE key = ANY($1)", [["general", "appearance", "whatsapp", "location", "pages"]]);
+  const { rows } = await q<{ key: string; value: unknown }>("SELECT key, value FROM settings WHERE key = ANY($1)", [["general", "appearance", "whatsapp", "location", "pages", "social"]]);
   res.json(ok(Object.fromEntries(rows.map((r) => [r.key, r.value]))));
 });
 
